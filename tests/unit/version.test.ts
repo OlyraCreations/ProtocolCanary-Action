@@ -95,6 +95,35 @@ afterEach(() => {
 });
 
 describe("resolveVersion", () => {
+  // #192: successful parse of a valid commit SHA from the GitHub tags API.
+  // Uses GitHub-shaped payloads — multiple tags in a realistic order and
+  // full-length 40-hex SHAs — so the test pins that the sha is taken from
+  // the *matching* entry (not the first one) and preserved byte for byte,
+  // with no truncation or normalization.
+  it("parses the full commit sha of the matching tag from the GitHub tags API (#192)", async () => {
+    const linuxSha = "3f2a9c8d7e6b5a4938271605f4e3d2c1b0a99887";
+    const targetSha = "c1a7f00d5e8b9273645f0e1d2c3b4a5968778695";
+    const v2Sha = "0f1e2d3c4b5a69788796a5b4c3d2e1f00918a7b6";
+    mockHttpsPages([
+      {
+        body: JSON.stringify([
+          { name: "v0.2.0", commit: { sha: linuxSha } },
+          { name: "v0.1.0", commit: { sha: targetSha } },
+          { name: "v0.0.1", commit: { sha: v2Sha } },
+        ]),
+      },
+    ]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: targetSha });
+    expect(resolved.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(resolved.commitSha).not.toBe(linuxSha);
+    expect(resolved.commitSha).not.toBe(v2Sha);
+    // One page fetched, no pagination needed for a first-page match.
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(1);
+  });
+
   it("resolves a matching tag to its commit sha", async () => {
     const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) }]);
     const resolved = await resolveVersion("0.1.0");
@@ -115,8 +144,51 @@ describe("resolveVersion", () => {
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
   });
 
+  it("degrades to commitSha undefined on a timed-out tag lookup request, never throwing (#263)", async () => {
+    // fetchTagsPage has its own "timeout" handler (distinct from the
+    // checksum-lookup timeout in canary.ts): it destroys the request with an
+    // error, which reaches the promise chain as a rejection that
+    // resolveVersion's catch turns into commitSha: undefined. Serving pages
+    // would never exercise it, so the mock is driven directly here: a fake
+    // request that only ever emits "timeout".
+    delete process.env.GITHUB_TOKEN;
+    class TimeoutOnlyRequest extends EventEmitter {
+      // Real ClientRequest.destroy(error) emits "error" with that error —
+      // exactly how the timeout rejection travels to fetchTagsPage's reject.
+      destroy(error?: Error): void {
+        if (error !== undefined) {
+          this.emit("error", error);
+        }
+      }
+    }
+    const request = new TimeoutOnlyRequest();
+    vi.mocked(https.get).mockImplementation(() => {
+      // Emit after the handlers are attached (fetchTagsPage wires "timeout"
+      // synchronously after https.get returns, so a queued emission always
+      // lands on a wired handler).
+      queueMicrotask(() => request.emit("timeout"));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return request as any;
+    });
+
+    await expect(resolveVersion("0.1.0")).resolves.toEqual({
+      version: "0.1.0",
+      tag: "v0.1.0",
+      commitSha: undefined,
+    });
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(1);
+  });
+
   it("degrades to commitSha undefined on malformed JSON, never throwing", async () => {
     mockHttpsPages([{ body: "not json" }]);
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+  });
+
+  it("degrades to commitSha undefined on well-formed JSON of an unexpected shape, never throwing", async () => {
+    // GitHub returns 200-shaped error bodies for some proxied failures; the
+    // tags list contract (an array) must reject them the same way, and
+    // InstallationFailedError stays confined to `cargo install` in canary.ts.
+    mockHttpsPages([{ body: '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}' }]);
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
   });
 
@@ -128,11 +200,30 @@ describe("resolveVersion", () => {
     expect(calls[0]?.headers["User-Agent"]).toBe("ProtocolCanary-Action");
   });
 
+  it("treats a whitespace-only explicit token as no token", async () => {
+    delete process.env.GITHUB_TOKEN;
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) }]);
+    await resolveVersion("0.1.0", { token: " \t\n " });
+    expect(calls[0]?.headers.Authorization).toBeUndefined();
+  });
+
   it("falls back to GITHUB_TOKEN from the environment when no explicit token is given", async () => {
     process.env.GITHUB_TOKEN = "ghp_from_env";
     const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) }]);
     await resolveVersion("0.1.0");
     expect(calls[0]?.headers.Authorization).toBe("Bearer ghp_from_env");
+  });
+
+  it("sends no Authorization header when an explicit token is whitespace-only (#262)", async () => {
+    // resolveToken counts blank/whitespace-only values as "no token" so an
+    // empty secret never produces a bad header. An explicit whitespace-only
+    // token — not just an unset GITHUB_TOKEN — must land on that same path.
+    delete process.env.GITHUB_TOKEN;
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) }]);
+    const resolved = await resolveVersion("0.1.0", { token: "   " });
+    expect(calls[0]?.headers).not.toHaveProperty("Authorization");
+    // The unauthenticated lookup still succeeds and pins the commit.
+    expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: "abc123" });
   });
 
   it("sends no Authorization header when no token is available", async () => {
@@ -174,5 +265,29 @@ describe("resolveVersion", () => {
       { body: tagsBody([{ name: "v9.9.8", sha: "yyy" }]) },
     ]);
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+  });
+
+  it("caps pagination at MAX_TAG_PAGES when the Link header never terminates", async () => {
+    // A malformed or hostile Link header must spin the page walk forever;
+    // every request re-serves this page, so the loop has to stop itself.
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]), link: nextLink(2) }]);
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+    expect(calls).toHaveLength(50);
+  });
+
+  it.each([
+    ["a missing commit object", [{ name: "v0.1.0" }]],
+    ["an empty commit.sha", [{ name: "v0.1.0", commit: { sha: "" } }]],
+    ["a non-string commit.sha", [{ name: "v0.1.0", commit: { sha: 123 } }]],
+  ])("degrades to commitSha undefined when the matched tag has %s, never throwing", async (_shape, tags) => {
+    // Distinct from "tag not found": the tag *is* present, but the entry has
+    // an unexpected GitHub API shape. resolveTagCommit rejects, yet
+    // resolveVersion's "never throws" contract still requires it to resolve
+    // with commitSha undefined and fall back to tag pinning.
+    // Uses the paginating mockHttpsPages helper so a matching tag on the first
+    // page needs no Link header, mirroring the not-found cases above.
+    mockHttpsPages([{ body: JSON.stringify(tags) }]);
+    const resolved = await resolveVersion("0.1.0");
+    expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: undefined });
   });
 });

@@ -22,6 +22,10 @@ All notable changes to this project are documented in this file.
   "How failures appear" now shows the actual rendered job summary for a
   passing run, a run with failures/warnings, and an execution failure,
   instead of describing the format only in prose.
+- `action.yml`'s `upload-report` description now states its default value
+  (`true`, matching the input's `default` key) and that setting it to
+  `false` skips the artifact upload, so the documented contract spells out
+  the default instead of leaving it to the `default` key alone.
 
 ### Added
 
@@ -46,12 +50,76 @@ All notable changes to this project are documented in this file.
   commit SHAs (with the human-readable version kept as a trailing comment)
   instead of mutable version tags, closing a supply-chain hole — most
   importantly in `release.yml`, which runs with `contents: write`.
+- A `config` input that names a directory is now rejected during input
+  validation with an `InvalidInput` error instead of being accepted and
+  forwarded to the `stellar-canary` CLI, which failed later with a generic,
+  less actionable error. `parseConfig` now requires the resolved path to be
+  a regular file (`fs.statSync(...).isFile()`) rather than merely existing.
+
+### Fixed
+
+- `examples/protocol-28.yml`'s fixtures checkout no longer pins
+  `ref: v0.1.0`, a tag that does not exist in
+  `StellarCanary/ProtocolCanary-Fixtures` (whose only tag is
+  `protocol-28`); copying the documented example verbatim no longer fails
+  at the checkout step ([#267]).
 
 ### Testing
 
+- Added a `resolveVersion` test pinning that an explicit whitespace-only
+  `token` is treated as "no token" — the tag-lookup request carries no
+  `Authorization` header at all, matching the documented empty-secret
+  handling ([#262]).
+- Added a `resolveVersion` test simulating a timed-out tags-page request
+  (a `"timeout"` event from the underlying `https.get` request), pinning
+  that the documented "never throws" contract holds for `fetchTagsPage`'s
+  timeout handler too: the run resolves with `commitSha: undefined` and
+  falls back to tag pinning ([#263]).
+- Added a `renderSummaryMarkdown` test pinning that a report whose
+  `skipped` field is present but empty (`skipped: []`) renders no
+  skipped-fixtures section, closing out the three-way
+  undefined/empty/non-empty condition ([#264]).
+- Added unit coverage for `parseChecksumManifest`'s documented tolerance
+  of the standard `sha256sum` format: `#` comment lines and `*`-prefixed
+  binary-mode entries are parsed and enforced during checksum
+  verification ([#275]).
+- Added unit coverage for the checksum-verification fallback when a published
+  checksum manifest exists but names no file matching the runner's platform:
+  `ensureCanaryInstalled` still succeeds with a debug log (commit/tag pinning
+  stands) and never throws `InstallationFailed` for a manifest that simply
+  does not cover this platform ([#259]).
 - Added unit coverage for `runCheck`'s `SIGINT`/`SIGTERM` forwarding to the
   child process, for cleanup of those listeners after settling, and for the
   cancellation branch where the child exits with a null code and a signal.
+- Added unit coverage for the private install-path helpers in `canary.ts`:
+  `cargoBinDir` now has tests pinning both the `CARGO_HOME`-anchored path and
+  the `~/.cargo/bin` fallback (observed through the Actions cache paths), and
+  `binaryName` has tests pinning `stellar-canary.exe` on `win32` and
+  `stellar-canary` elsewhere, with `process.platform` overridden so both
+  branches run on any runner OS ([#220], [#224]).
+- Added unit coverage that `renderSummaryMarkdown`'s Failures/Warnings
+  sections (driven by `notablyList`'s status filter) list only results with
+  a requested status: fail and error under Failures, warning under Warnings,
+  and no section rendered when no result matches ([#188]).
+- Added a `resolveVersion` test pinning the successful parse of a full
+  40-character commit SHA for the matching tag from the GitHub tags API,
+  including that the SHA comes from the matching entry rather than the first
+  one ([#192]).
+- Added unit coverage for `main.ts`'s `run()`: a run whose process is killed
+  by a signal (null exit code) is reported as an execution failure naming the
+  signal, and a `writeSummary` rejection on the otherwise-successful path
+  fails the run without overwriting the already-set pass/fail outputs
+  ([#271]).
+- Added end-to-end coverage for the `annotations` input's "off" state: a
+  fail run and a config-error (execution-failure) run with
+  `annotations: false` still fail the job and still write the job summary,
+  but emit no error/warning annotations ([#277]).
+- Added an end-to-end test that `upload-report: true` actually invokes the
+  artifact upload path: the artifact client's upload method is called once
+  with the stable name and the exact report file the run produced ([#278]).
+- Added an `inputs` test pinning that plain `http://` is rejected for the
+  IPv6 loopback `http://[::1]`, documenting the current
+  `localhost`/`127.0.0.1`-only exemption as a known contract ([#276]).
 
 ## [0.1.1]
 
