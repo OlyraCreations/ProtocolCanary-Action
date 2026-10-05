@@ -152,6 +152,16 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
   ].join("\n");
 }
 
+/**
+ * Publishes `markdown` to the current GitHub Actions job summary.
+ *
+ * This wraps `core.summary.addRaw(markdown, true).write()`. If adding or
+ * writing the summary fails, it throws {@link SummaryPublishFailedError}
+ * with the underlying error message.
+ *
+ * @param markdown Markdown to append to the job summary.
+ * @throws {SummaryPublishFailedError} When summary publication fails.
+ */
 export async function writeSummary(markdown: string): Promise<void> {
   try {
     await core.summary.addRaw(markdown, true).write();
