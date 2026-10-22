@@ -1,0 +1,85 @@
+name: Engine compatibility
+
+# Runs this Action's own code against REAL builds of Protocol-Canary (not the
+# mock engine used by the normal test suite) to show which engine releases the
+# Action works with. Manual only: it builds the engine from source, so it is not
+# part of the required checks. Offline scenarios only, no network and no secrets.
+# See tests/integration/real-engine.test.ts for what is asserted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: Protocol-Canary tag, branch or commit to test (for example v0.2.0 once it exists, or main)
+        required: true
+        default: main
+      legacy_ref:
+        description: An older Protocol-Canary tag that must keep working with the same inputs
+        required: true
+        default: v0.1.1
+
+permissions:
+  contents: read
+
+jobs:
+  real-engine:
+    name: Action against Protocol-Canary ${{ inputs.engine_ref }} and ${{ inputs.legacy_ref }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Checkout engine under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/Protocol-Canary
+          ref: ${{ inputs.engine_ref }}
+          path: engine-under-test
+          persist-credentials: false
+
+      - name: Checkout older engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/Protocol-Canary
+          ref: ${{ inputs.legacy_ref }}
+          path: engine-legacy
+          persist-credentials: false
+
+      - name: Build both engines
+        run: |
+          (cd engine-under-test && cargo build --release --locked)
+          (cd engine-legacy && cargo build --release --locked)
+          bin_suffix=""
+          root_dir="$PWD"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin_suffix=".exe"
+            root_dir="$(pwd -W 2>/dev/null || cygpath -m "$PWD" 2>/dev/null || echo "$PWD")"
+          fi
+          echo "STELLAR_CANARY_BIN=$root_dir/engine-under-test/target/release/stellar-canary$bin_suffix" >> "$GITHUB_ENV"
+          echo "STELLAR_CANARY_LEGACY_BIN=$root_dir/engine-legacy/target/release/stellar-canary$bin_suffix" >> "$GITHUB_ENV"
+
+      - name: Report the engine versions being tested
+        run: |
+          "$STELLAR_CANARY_BIN" version
+          "$STELLAR_CANARY_LEGACY_BIN" version
+
+      - name: Run the Action against the real engines
+        run: npx vitest run tests/integration/real-engine.test.ts

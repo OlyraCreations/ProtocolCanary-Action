@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 
+import { describeExitCode } from "./output";
 import type { CanaryReport } from "./output";
 
 const TITLE = "Stellar Protocol Canary";
@@ -30,6 +31,50 @@ export function emitAnnotations(report: CanaryReport): void {
   }
 }
 
-export function emitExecutionFailureAnnotation(reason: string): void {
-  core.error(`Protocol Canary could not be executed: ${reason}`, { title: TITLE });
+/**
+ * Emits a workflow-level error annotation when Canary could not be executed
+ * or did not produce a usable report. Use this for execution failures
+ * (install, process, timeout, or parse errors) instead of `emitAnnotations`,
+ * which annotates individual results from a report. Like `emitAnnotations`,
+ * this never attaches a file/line location.
+ *
+ * When a diagnostic is available (the engine's stderr, a timeout notice), it
+ * is appended so the annotation shows the engine's own reason instead of only
+ * a generic "could not be executed" (issue #351).
+ */
+export function emitExecutionFailureAnnotation(reason: string, diagnostic?: string): void {
+  const message = `Protocol Canary could not be executed: ${reason}`;
+  const detail = diagnostic?.trim() ?? "";
+  core.error(detail === "" ? message : `${message}\nEngine diagnostic: ${detail}`, { title: TITLE });
+}
+
+/**
+ * Emits a workflow-level error annotation when a supplied `baseline-report`
+ * cannot be used (#344): the file is missing, is not a Canary report, or was
+ * recorded for a different target protocol. Kept distinct from the
+ * execution-failure annotation because Canary itself ran successfully; the
+ * failure is in the comparison input, not the engine.
+ */
+export function emitBaselineFailureAnnotation(reason: string): void {
+  core.error(`Protocol Canary baseline validation failed: ${reason}`, { title: TITLE });
+}
+
+/**
+ * The engine exit code arrived, but the run did not pass (#351): turn the
+ * exit code into an explicit classification plus the engine's own root
+ * diagnostic, instead of a bare "Process exited with code N".
+ *
+ * Exit code 1 is classified as test assertion failures, exit code 2 as the
+ * regression gate (or an invalid configuration), and exit code 3 as an
+ * unexpected runtime crash — never as a regression — following
+ * {@link describeExitCode}'s contract table.
+ *
+ * Like every other annotation this Action emits, it carries no file/line
+ * location: no fixture in the report schema carries one.
+ */
+export function emitExitFailureAnnotation(exitCode: number, diagnostic: string): void {
+  const exitInfo = describeExitCode(exitCode);
+  const message = `Stellar Protocol Canary reported a failure (exit code ${String(exitCode)}): ${exitInfo.description}`;
+  const detail = diagnostic.trim();
+  core.error(detail === "" ? message : `${message}\nEngine diagnostic: ${detail}`, { title: TITLE });
 }

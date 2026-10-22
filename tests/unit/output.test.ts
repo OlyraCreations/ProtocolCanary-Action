@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { InvalidReportError } from "../../src/errors";
-import { describeExitCode, parseReport } from "../../src/output";
+import { countReplayed, describeExitCode, isReplayed, parseReport, resolvePackIdentity } from "../../src/output";
+import type { CanaryFixturePack } from "../../src/output";
 import { report, result } from "./helpers";
 
 const VALID_REPORT = JSON.stringify(
@@ -132,16 +133,337 @@ describe("parseReport", () => {
   it("trusts a well-formed counts field from the CLI rather than recomputing it", () => {
     // If the CLI's own counts ever legitimately differed from a naive
     // recount (e.g. a future aggregation rule), the Action must not
-    // second-guess it.
-    const report = { ...JSON.parse(VALID_REPORT), counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 9 } };
+    // second-guess it — but counts must agree with results/skipped.
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+    };
     const parsed = parseReport(JSON.stringify(report));
-    expect(parsed.counts.skipped).toBe(9);
+    expect(parsed.counts.skipped).toBe(0);
+  });
+
+  it("rejects a counts field that disagrees with results/skipped", () => {
+    // A counts field that disagrees with the actual results/skipped is invalid
+    const report = { ...JSON.parse(VALID_REPORT), counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 9 } };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/disagrees with results\/skipped/);
   });
 
   it("derives counts when the provided counts field is malformed", () => {
-    const report = { ...JSON.parse(VALID_REPORT), counts: { total: "not-a-number" } };
+    // counts with wrong type fails isCountsShape check, so derived counts are used
+    const report = { ...JSON.parse(VALID_REPORT), counts: { total: "not-a-number", passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 } };
     const parsed = parseReport(JSON.stringify(report));
     expect(parsed.counts).toEqual({ total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 });
+  });
+
+  it("preserves counts and defaults skipped to 0 when counts.skipped is absent (older engines)", () => {
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 5, passed: 5, failed: 0, warnings: 0, errors: 0 },
+    };
+    const parsed = parseReport(JSON.stringify(report));
+    expect(parsed.counts.total).toBe(5);
+    expect(parsed.counts.skipped).toBe(0);
+  });
+
+  it("preserves counts and populates skipped from skipped array when counts.skipped is absent (older engines)", () => {
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0 },
+      skipped: [{ fixtureId: "s1", surface: "xdr", reason: "protocol mismatch" }],
+    };
+    const parsed = parseReport(JSON.stringify(report));
+    expect(parsed.counts.total).toBe(2);
+    expect(parsed.counts.skipped).toBe(1);
+  });
+
+  // Regression tests for issue #67: the top-level report is otherwise
+  // valid, but a single malformed `results` entry must be rejected at
+  // parse time with InvalidReportError — not surface later as "undefined"
+  // in annotations or the summary markdown.
+  const RESULT_FIXTURE = JSON.parse(VALID_REPORT) as Record<string, unknown>;
+
+  function reportWithResultEntry(entry: unknown): string {
+    return JSON.stringify({ ...RESULT_FIXTURE, results: [entry] });
+  }
+
+  it("rejects a report whose results array contains a non-object entry", () => {
+    expect(() => parseReport(reportWithResultEntry("not-an-object"))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing testId", () => {
+    const { testId: _testId, ...rest } = {
+      testId: "p28-xdr-cap83-empty-tx-set",
+      protocol: 28,
+      surface: "xdr",
+      status: "pass",
+      summary: "ok",
+      durationMs: 1,
+      fixtureId: "p28-xdr-cap83-empty-tx-set",
+    };
+    expect(() => parseReport(reportWithResultEntry(rest))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing surface", () => {
+    const entry = { testId: "a", protocol: 28, status: "pass", summary: "ok", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing status", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", summary: "ok", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry with an invalid status value", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "anything", summary: "ok", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry with an invalid surface value", () => {
+    const entry = { testId: "a", protocol: 28, surface: "graphql", status: "pass", summary: "ok", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing summary", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "pass", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing durationMs", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry with a non-numeric durationMs", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: "100", fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing fixtureId", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1 };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("accepts a result entry with a null fixtureId", () => {
+    const entry = { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: null };
+    expect(() => parseReport(reportWithResultEntry(entry))).not.toThrow();
+  });
+
+  it("rejects a result entry with multiple malformed fields", () => {
+    const entry = { testId: 7, surface: "xdr", status: "nope", summary: "ok", durationMs: "100", fixtureId: null };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a result entry missing the required protocol field", () => {
+    const entry = { testId: "a", surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "a" };
+    expect(() => parseReport(reportWithResultEntry(entry))).toThrow(InvalidReportError);
+  });
+
+  it("identifies the offending result index in the error message", () => {
+    const bad = { testId: "a", protocol: 28, surface: "xdr", summary: "ok", durationMs: 1, fixtureId: "a" };
+    const good = { testId: "b", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "b" };
+    const report = { ...RESULT_FIXTURE, results: [good, bad] };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/results\[1\]/);
+  });
+
+  it("rejects a skipped entry with a missing required field", () => {
+    const report = { ...RESULT_FIXTURE, skipped: [{ fixtureId: "f", surface: "xdr" }] };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+  });
+
+  it("rejects a skipped entry with an incorrect field type", () => {
+    const report = { ...RESULT_FIXTURE, skipped: [{ fixtureId: "f", surface: "xdr", reason: 42 }] };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+  });
+
+  it("accepts a well-formed skipped entry", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+      skipped: [{ fixtureId: "f", surface: "xdr", reason: "disabled" }],
+    };
+    expect(() => parseReport(JSON.stringify(report))).not.toThrow();
+  });
+
+  it("rejects a skipped field that is present but not an array", () => {
+    const report = { ...RESULT_FIXTURE, skipped: "none" };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+  });
+
+  // #349 / CF-01 section 4: a result is identified inside one report by
+  // `(surface, fixtureId)` — `testId` when `fixtureId` is absent — and a
+  // report in which two results share an identity is invalid. Duplicates
+  // could otherwise skew derived counts or hide a failure behind a copy of
+  // a passing result.
+  it("rejects a report with two results sharing the same (surface, fixtureId) identity (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      results: [
+        { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "b", protocol: 28, surface: "xdr", status: "fail", summary: "bad", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/duplicate result identity/);
+  });
+
+  it("names the exact duplicate identity and surface in the error message (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      results: [
+        { testId: "a", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "b", protocol: 28, surface: "rpc", status: "fail", summary: "bad", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/\("rpc", "dup"\)/);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/results\[1\]/);
+  });
+
+  it("accepts the same fixtureId on different surfaces (identity is per-surface) (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+      results: [
+        { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "a", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).not.toThrow();
+  });
+
+  it("uses testId as the identity when fixtureId is null, rejecting duplicates there too (#349)", () => {
+    const dup = (surface: string): Record<string, unknown> => ({
+      testId: "shared-test",
+      protocol: 28,
+      surface,
+      status: "pass",
+      summary: "ok",
+      durationMs: 1,
+      fixtureId: null,
+    });
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 }, results: [dup("xdr"), dup("xdr")] }))).toThrow(
+      InvalidReportError,
+    );
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 }, results: [dup("xdr"), dup("rpc")] }))).not.toThrow();
+  });
+
+  it("passes cleanly when every result identity is distinct (#349)", () => {
+    const report = JSON.parse(VALID_REPORT) as Record<string, unknown>;
+    expect(() => parseReport(JSON.stringify(report))).not.toThrow();
+  });
+});
+
+describe("isReplayed / countReplayed", () => {
+  // #350 / CF-01 section 6: `source: "cache"` marks a result replayed from
+  // the engine's result cache; engines that predate the cache emit no
+  // `source` at all and every result counts as live.
+  it("counts results whose source is \"cache\" (#350)", () => {
+    expect(countReplayed(report([result({ source: "cache" }), result({ source: "live" })]))).toBe(1);
+    expect(isReplayed(result({ source: "cache" }))).toBe(true);
+    expect(isReplayed(result({ source: "live" }))).toBe(false);
+  });
+
+  it("treats an absent source as not recorded — counted as 0, without throwing (#350)", () => {
+    expect(countReplayed(report([result(), result()]))).toBe(0);
+    expect(isReplayed(result())).toBe(false);
+  });
+
+  it("reads an unknown source value as not recorded, never as replayed (#350)", () => {
+    expect(isReplayed(result({ source: "disk" }))).toBe(false);
+    expect(isReplayed(result({ source: 42 as unknown as string }))).toBe(false);
+  });
+
+  it("honors boolean replayed/cached attributes alongside source (#350)", () => {
+    expect(isReplayed(result({ replayed: true }))).toBe(true);
+    expect(isReplayed(result({ cached: true }))).toBe(true);
+    expect(isReplayed(result({ replayed: false, cached: false }))).toBe(false);
+    // A boolean flag never reclassifies a live result.
+    expect(isReplayed(result({ source: "live", replayed: true }))).toBe(true);
+    expect(isReplayed(result({ source: "live", replayed: false }))).toBe(false);
+  });
+
+  it("parses a report carrying the additive source field without rejecting it (#350)", () => {
+    const parsed = parseReport(
+      JSON.stringify({
+        ...(JSON.parse(VALID_REPORT) as Record<string, unknown>),
+        results: [
+          { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "a", source: "cache" },
+        ],
+      }),
+    );
+    expect(countReplayed(parsed)).toBe(1);
+  });
+});
+
+describe("skipped fixture reason codes (#341)", () => {
+  it("parses and preserves an optional code on skipped entries", () => {
+    const parsed = parseReport(
+      JSON.stringify({
+        ...(JSON.parse(VALID_REPORT) as Record<string, unknown>),
+        skipped: [
+          { fixtureId: "p27-xdr-old", surface: "xdr", reason: "targets 27", code: "UNSUPPORTED_PROTOCOL" },
+          { fixtureId: "p28-rpc-missing", surface: "rpc", reason: "no capability" },
+        ],
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 2 },
+      }),
+    );
+    expect(parsed.skipped?.[0]?.code).toBe("UNSUPPORTED_PROTOCOL");
+    expect(parsed.skipped?.[1]?.code).toBeUndefined();
+  });
+
+  it("rejects a non-string code when the field is present", () => {
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      skipped: [{ fixtureId: "f", surface: "xdr", reason: "why", code: 42 }],
+    };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/skipped\[0\].*code/);
+  });
+});
+
+describe("resolvePackIdentity (#340)", () => {
+  const DIGEST = "A".repeat(64);
+  const CANONICAL = `sha256:${"a".repeat(64)}`;
+
+  it("reads the CF-02 fixturePack digest and normalizes it to lowercase sha256", () => {
+    const identity = resolvePackIdentity(report({ fixturePack: { digest: `sha256:${DIGEST}`, protocol: 28 } }));
+    expect(identity).toEqual({ digest: CANONICAL, protocol: 28 });
+  });
+
+  it("accepts a bare 64-hex digest and prefixes it", () => {
+    expect(resolvePackIdentity(report({ fixturePack: { digest: DIGEST } })).digest).toBe(CANONICAL);
+  });
+
+  it("falls back to the validated pack inputs for version and protocol", () => {
+    const identity = resolvePackIdentity(report({ targetProtocol: 29 }), {
+      fixturesPackVersion: "v1.2.0",
+      fixturesPackProtocol: 28,
+    });
+    expect(identity).toEqual({ version: "v1.2.0", protocol: 28 });
+  });
+
+  it("uses the run's target protocol when a digest is recorded without one", () => {
+    expect(resolvePackIdentity(report({ targetProtocol: 29, fixturePack: { digest: CANONICAL } }))).toEqual({
+      digest: CANONICAL,
+      protocol: 29,
+    });
+  });
+
+  it("reads a legacy top-level packDigest", () => {
+    expect(resolvePackIdentity(report({ packDigest: CANONICAL })).digest).toBe(CANONICAL);
+  });
+
+  it("returns an empty identity when no external pack is recorded or pinned", () => {
+    expect(resolvePackIdentity(report())).toEqual({});
+  });
+
+  it("ignores malformed digests and fixturePack shapes rather than throwing", () => {
+    expect(resolvePackIdentity(report({ packDigest: "sha256:not-hex" }))).toEqual({});
+    expect(
+      resolvePackIdentity(report({ fixturePack: ["not", "an", "object"] as unknown as CanaryFixturePack })),
+    ).toEqual({});
+    const huge = report({ fixturePack: { protocol: 0, version: "   " } });
+    expect(resolvePackIdentity(huge)).toEqual({});
   });
 });
 

@@ -6,8 +6,9 @@
  * the MOCK_CANARY_SCENARIO environment variable; MOCK_CANARY_VERSION
  * overrides the version string reported by `version`.
  *
- * Supported scenarios: pass, pass-no-counts, warning, fail, config-error,
- * rpc-error, fixture-error, internal-error, malformed-json, timeout.
+ * Supported scenarios: pass, pass-network, pass-no-counts, pass-with-result-source, warning,
+ * fail, config-error, empty-run, rpc-error, fixture-error, internal-error,
+ * malformed-json, timeout.
  */
 "use strict";
 
@@ -130,6 +131,29 @@ switch (scenario) {
     break;
   }
 
+  case "pass-network": {
+    emit(
+      baseReport({
+        status: "pass",
+        network: { name: "testnet", observedProtocol: 28 },
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          {
+            testId: "p28-xdr-cap83-empty-tx-set",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "StellarValue round-tripped byte-for-byte",
+            durationMs: 1,
+            fixtureId: "p28-xdr-cap83-empty-tx-set",
+          },
+        ],
+      }),
+      0,
+    );
+    break;
+  }
+
   case "pass-no-counts": {
     // Simulates Protocol-Canary's actual tagged v0.1.0 release, whose
     // schemaVersion-1 report predates the `counts` field.
@@ -152,6 +176,51 @@ switch (scenario) {
     // when this file is checked with `// @ts-check` / `checkJs`.
     delete /** @type {any} */ (report).counts;
     emit(report, 0);
+    break;
+  }
+
+  case "pass-with-result-source": {
+    // A report from an engine release that marks where each result came from
+    // (`results[].source`, "live" or "cache") and gives each skip a stable
+    // `code`. Both are additive optional fields in schemaVersion 1, so a
+    // consumer written before they existed must still read the report.
+    emit(
+      baseReport({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        results: [
+          {
+            testId: "p28-xdr-cap83-empty-tx-set",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "StellarValue round-tripped byte-for-byte",
+            durationMs: 1,
+            fixtureId: "p28-xdr-cap83-empty-tx-set",
+            source: "live",
+          },
+          {
+            testId: "p28-xdr-cap85-external-ref-roundtrip",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "ContractExecutable round-tripped byte-for-byte",
+            durationMs: 0,
+            fixtureId: "p28-xdr-cap85-external-ref-roundtrip",
+            source: "cache",
+          },
+        ],
+        skipped: [
+          {
+            fixtureId: "p27-xdr-old",
+            surface: "xdr",
+            reason: "fixture targets protocol 27, this run targets protocol 28",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+        ],
+      }),
+      0,
+    );
     break;
   }
 
@@ -205,6 +274,18 @@ switch (scenario) {
 
   case "config-error": {
     fail(2, "configuration error: unsupported config version 2");
+    break;
+  }
+
+  case "empty-run": {
+    // The engine's refusal to report success for a run that executes nothing
+    // (maintainer decision D-02, releases after 0.1.1): exit code 2, nothing
+    // on stdout, and the explanation on stderr. The text is the engine's
+    // real message for `check --protocol 29` against a Protocol 28 pack.
+    fail(
+      2,
+      "configuration error: no checks ran: all 7 loaded fixtures were skipped. 7 target another protocol (this run targets protocol 29; the fixtures target protocol 28). Executing nothing is not evidence of compatibility; pass --allow-empty if an empty run is intended.",
+    );
     break;
   }
 
